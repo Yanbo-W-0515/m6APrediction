@@ -1,0 +1,345 @@
+---
+title: "m6APrediction: predicting m6A RNA modification sites with a random forest"
+subtitle: "BIO215 Bioinformatics Project — R package and model analysis report"
+author: "Yanbo.Wang"
+output:
+  github_document:
+    toc: false
+  html_document:
+    self_contained: true
+    toc: false
+    number_sections: false
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.align = "center", comment = "#>"
+)
+suppressPackageStartupMessages(library(knitr))
+```
+
+```{r analysis-data, include=FALSE}
+# Everything below is derived from files shipped in data-raw/, so the report
+# can be rebuilt without installing the package.
+dat <- read.csv("data-raw/m6A_imbalanced.csv", stringsAsFactors = FALSE)
+dat$m6A_status <- factor(dat$m6A_status, levels = c("Negative", "Positive"))
+
+oob <- readRDS("data-raw/oob_predictions.rds")
+oob$truth <- factor(oob$truth, levels = c("Negative", "Positive"))
+truth_pos <- oob$truth == "Positive"
+p <- oob$prob_positive
+n_pos <- sum(truth_pos)
+n_neg <- sum(!truth_pos)
+
+ord <- order(p, decreasing = TRUE)
+tp <- cumsum(truth_pos[ord])
+fp <- cumsum(!truth_pos[ord])
+tpr <- tp / n_pos
+fpr <- fp / n_neg
+prec <- tp / (tp + fp)
+rec <- tpr
+auc <- sum(diff(c(0, fpr)) * (c(0, tpr)[-1] + c(0, tpr)[-length(c(0, tpr))]) / 2)
+ap <- sum(diff(c(0, rec)) * prec)
+
+thresholds <- seq(0.05, 0.95, by = 0.05)
+sweep <- do.call(rbind, lapply(thresholds, function(th) {
+  pred_pos <- p > th
+  TP <- sum(pred_pos & truth_pos);  FP <- sum(pred_pos & !truth_pos)
+  TN <- sum(!pred_pos & !truth_pos); FN <- sum(!pred_pos & truth_pos)
+  data.frame(threshold = th, TP = TP, FP = FP, TN = TN, FN = FN,
+             sensitivity = TP / (TP + FN),
+             specificity = TN / (TN + FP),
+             precision   = ifelse(TP + FP == 0, NA, TP / (TP + FP)),
+             accuracy    = (TP + TN) / length(p),
+             f1          = ifelse(TP + FP == 0, NA, 2 * TP / (2 * TP + FP + FN)),
+             predicted_positive = sum(pred_pos))
+}))
+cm <- sweep[sweep$threshold == 0.5, ]
+best_f1 <- sweep[which.max(sweep$f1), ]
+```
+
+# Overview
+
+I built **m6APrediction** to estimate whether a candidate adenosine in a human transcript may be an m6A site. `prediction_single()` predicts one site, while `prediction_multiple()` predicts a table of sites and adds a probability and a class label. The package includes a fitted model and a small example table, so it can be used without an internet connection after installation.
+
+## At a glance
+
+| Item | Value |
+|------------------------------------|------------------------------------|
+| Task | Binary classification of candidate adenosines (m6A vs. not m6A) |
+| Algorithm | Random forest (`randomForest` 4.7-x), 500 trees, `mtry = 3` |
+| Training sites | `r format(nrow(dat), big.mark = ",")` human candidate sites |
+| Class balance | `r format(sum(dat$m6A_status == "Positive"), big.mark = ",")` positive / `r format(sum(dat$m6A_status == "Negative"), big.mark = ",")` negative (`r sprintf("%.1f", 100 * mean(dat$m6A_status == "Positive"))`% prevalence) |
+| Predictors | 6 numeric or categorical features + 5 encoded nucleotide positions |
+| Out-of-bag AUC | `r sprintf("%.3f", auc)` |
+| Out-of-bag average precision | `r sprintf("%.3f", ap)` |
+| Default decision threshold | 0.5 |
+
+# Installation
+
+The package needs R 3.5.0 or newer and `randomForest`. The other listed packages are only needed to generate this report.
+
+```{r install, eval=FALSE, echo=TRUE}
+# From the source tarball
+install.packages("m6APrediction_1.0.0.tar.gz", repos = NULL, type = "source")
+
+library(m6APrediction)
+```
+
+# Quick start
+
+## One site
+
+```{r quick-single, eval=FALSE, echo=TRUE}
+library(m6APrediction)
+
+ml_fit <- readRDS(system.file("extdata", "rf_fit.rds",
+                              package = "m6APrediction", mustWork = TRUE))
+
+prediction_single(
+  ml_fit = ml_fit,
+  gc_content = 0.65,
+  RNA_type = "mRNA",
+  RNA_region = "CDS",
+  exon_length = 10.63,
+  distance_to_junction = 7.66,
+  evolutionary_conservation = 0.18,
+  DNA_5mer = "GGACA"
+)
+#> predicted_m6A_prob predicted_m6A_status
+#>             "0.946"           "Positive"
+```
+
+`prediction_single()` returns a probability and a class label. By default, a site is labelled positive when its probability is above 0.5. This cutoff can be changed with `positive_threshold`.
+
+## A table of sites
+
+```{r quick-batch, eval=FALSE, echo=TRUE}
+library(m6APrediction)
+
+ml_fit <- readRDS(system.file("extdata", "rf_fit.rds",
+                              package = "m6APrediction", mustWork = TRUE))
+
+example_csv <- system.file("extdata", "m6A_input_example.csv",
+                           package = "m6APrediction")
+sites <- read.csv(example_csv)
+
+scored <- prediction_multiple(ml_fit = ml_fit, feature_df = sites,
+                              positive_threshold = 0.5)
+head(scored[, c("DNA_5mer", "predicted_m6A_prob", "predicted_m6A_status")], 3)
+#>   DNA_5mer predicted_m6A_prob predicted_m6A_status
+#> 1    GAACA              0.876             Positive
+#> 2    GAACC              0.000             Negative
+#> 3    AAACT              0.498             Negative
+```
+
+The input table needs the seven features listed below. Other columns are kept in the output, which adds `predicted_m6A_prob` and `predicted_m6A_status`.
+
+# Data
+
+The course dataset contains `r format(nrow(dat), big.mark = ",")` candidate sites and 16 columns. Seven columns are model features; the others record site identifiers, coverage and m6A level.
+
+```{r variable-table, results='asis'}
+var_info <- data.frame(
+  Variable = c("chromosome", "start", "end", "width", "strand", "m6A_status",
+               "m6A_coverage", "total_coverage", "m6A_level", "gc_content",
+               "DNA_5mer", "RNA_type", "RNA_region", "exon_length",
+               "distance_to_junction", "evolutionary_conservation"),
+  Role = c(rep("Identifier / annotation", 5), "Label", "Coverage", "Coverage",
+           "Label source", "Predictor", "Predictor", "Predictor", "Predictor",
+           "Predictor", "Predictor", "Predictor"),
+  Type = c("character", "integer", "integer", "integer", "character",
+           "character", "integer", "integer", "numeric", "numeric",
+           "character", "character", "character", "numeric", "numeric",
+           "numeric"),
+  Description = c(
+    "Reference chromosome",
+    "Genomic start of the site",
+    "Genomic end of the site",
+    "Genomic width of the site",
+    "Genomic strand (+/-)",
+    "Modification label (Positive / Negative)",
+    "Reads supporting the modification",
+    "Total reads at the locus",
+    "Quantitative modification level (0-1)",
+    "GC content of the local sequence (0-1)",
+    "DNA 5-mer centred on the candidate adenosine",
+    "Transcript biotype",
+    "Transcript region",
+    "Host exon length (log-transformed units)",
+    "Distance to the nearest splice junction (log-transformed units)",
+    "Cross-species evolutionary conservation (0-1)"
+  )
+)
+kable(var_info, align = c("l", "l", "l", "l"),
+      caption = "Variables in the m6A training table.")
+```
+
+The model uses only the seven predictor columns. `m6A_status` is the label; coverage, m6A level and genomic coordinates are not used as model inputs.
+
+## Class balance and composition
+
+```{r fig-overview, fig.cap="Dataset overview. (A) Class balance. (B) Transcript biotype. (C) Transcript region. (D) Distribution of the quantitative m6A level.", out.width="100%"}
+knitr::include_graphics("man/figures/fig01_dataset_overview.png")
+```
+
+The classes are uneven: `r sprintf("%.1f", 100 * mean(dat$m6A_status == "Positive"))`% of the sites are positive. Most rows are mRNA (86.1%). The dataset also has many sites in 3'UTRs (40.2%) and CDS regions (33.2%). The positive rate is 26.1% in 3'UTRs and 16.8% in introns, so I included transcript region and type as model features.
+
+```{r composition-table, results='asis'}
+comp <- rbind(
+  data.frame(Annotation = "RNA_type", Level = names(table(dat$RNA_type)),
+             Sites = format(as.integer(table(dat$RNA_type)), big.mark = ","),
+             Positive = sprintf("%.1f%%", 100 * prop.table(table(dat$RNA_type, dat$m6A_status), 1)[, "Positive"])),
+  data.frame(Annotation = "RNA_region", Level = names(table(dat$RNA_region)),
+             Sites = format(as.integer(table(dat$RNA_region)), big.mark = ","),
+             Positive = sprintf("%.1f%%", 100 * prop.table(table(dat$RNA_region, dat$m6A_status), 1)[, "Positive"]))
+)
+kable(comp, align = c("l", "l", "r", "r"),
+      caption = "Sites per annotation level and the positive rate within each level.")
+```
+
+# Methods
+
+## Feature encoding
+
+The seven input features are:
+
+1.  `gc_content` — GC content of the local sequence;
+2.  `RNA_type` — mRNA, lincRNA, lncRNA or pseudogene;
+3.  `RNA_region` — CDS, intron, 3'UTR or 5'UTR;
+4.  `exon_length` — host exon length on the log scale used during training;
+5.  `distance_to_junction` — distance to the nearest splice junction, log scale;
+6.  `evolutionary_conservation` — conservation score between 0 and 1;
+7.  `DNA_5mer` — the five nucleotides centred on the candidate adenosine.
+
+`dna_encoding()` splits each 5-mer into five letter columns. The prediction functions do this automatically, so the input stays as one five-letter string. In this dataset the centre letter is always A; the model uses the four surrounding positions instead.
+
+## Model and evaluation
+
+The model has 500 trees and `mtry = 3`. I used its out-of-bag (OOB) predictions to calculate the results below. Each OOB prediction comes from trees that did not use that site for training. The report shows AUC, average precision and results at different probability cutoffs.
+
+# Results
+
+## Feature distributions by class
+
+```{r fig-features, fig.cap="Distributions of the four continuous predictors, split by observed class.", out.width="100%"}
+knitr::include_graphics("man/figures/fig02_feature_distributions.png")
+```
+
+```{r median-table, results='asis'}
+med <- aggregate(
+  dat[, c("gc_content", "exon_length", "distance_to_junction",
+          "evolutionary_conservation")],
+  by = list(Status = dat$m6A_status), FUN = median
+)
+med[, -1] <- round(med[, -1], 2)
+kable(med, align = c("l", "r", "r", "r", "r"),
+      caption = "Median predictor values in the two classes.")
+```
+
+Compared with negative sites, positive sites have higher median GC content, exon length and junction distance. Their median conservation score is lower.
+
+## Variable importance
+
+```{r fig-importance, fig.cap="Random forest variable importance (mean decrease in Gini impurity).", out.width="85%"}
+knitr::include_graphics("man/figures/fig03_feature_importance.png")
+```
+
+`distance_to_junction` and `exon_length` have the highest importance scores. Conservation and GC content follow. The positions beside the central A also contribute, while `RNA_type` has the lowest score in this model.
+
+## Discrimination: ROC and precision-recall
+
+```{r fig-roc, fig.cap="Out-of-bag ROC curve.", out.width="62%"}
+knitr::include_graphics("man/figures/fig04_roc_curve.png")
+```
+
+```{r fig-prc, fig.cap="Out-of-bag precision-recall curve. The dashed line is the positive-class prevalence (0.234).", out.width="62%"}
+knitr::include_graphics("man/figures/fig05_prc_curve.png")
+```
+
+The OOB AUC is `r sprintf("%.3f", auc)` and average precision is `r sprintf("%.3f", ap)`. The positive class makes up `r sprintf("%.3f", mean(truth_pos))` of the data, so the precision-recall curve is useful for seeing how well the model finds positive sites.
+
+## Choosing an operating threshold
+
+```{r fig-threshold, fig.cap="Sensitivity, specificity, precision and F1 as a function of the positive-class probability threshold.", out.width="85%"}
+knitr::include_graphics("man/figures/fig06_threshold_tradeoff.png")
+```
+
+```{r threshold-table, results='asis'}
+show <- sweep[round(sweep$threshold, 2) %in% c(0.30, 0.40, 0.50, 0.60, 0.70), ]
+show <- show[, c("threshold", "sensitivity", "specificity", "precision",
+                 "accuracy", "f1", "predicted_positive")]
+show[, 2:6] <- round(show[, 2:6], 3)
+show$threshold <- sprintf("%.2f", show$threshold)
+show$predicted_positive <- format(show$predicted_positive, big.mark = ",")
+kable(show, row.names = FALSE,
+      align = c("r", "r", "r", "r", "r", "r", "r"),
+      col.names = c("Threshold", "Sensitivity", "Specificity", "Precision",
+                    "Accuracy", "F1", "Predicted positive"),
+      caption = "Operating characteristics at selected thresholds.")
+```
+
+At the default cutoff of 0.5, the model labels `r format(cm$TP + cm$FP, big.mark = ",")` sites as positive, of which `r format(cm$TP, big.mark = ",")` are true positives (precision `r sprintf("%.1f%%", 100 * cm$precision)`). It misses `r format(cm$FN, big.mark = ",")` true sites (sensitivity `r sprintf("%.1f%%", 100 * cm$sensitivity)`). At 0.30, sensitivity rises to `r sprintf("%.1f%%", 100 * best_f1$sensitivity)` and F1 is `r sprintf("%.3f", best_f1$f1)`, with more false positives. The cutoff can be changed with `positive_threshold` depending on the intended use.
+
+```{r fig-confusion, fig.cap="Confusion matrix at the default threshold of 0.5.", out.width="62%"}
+knitr::include_graphics("man/figures/fig08_confusion_matrix.png")
+```
+
+## Calibration
+
+```{r fig-calibration, fig.cap="Calibration plot: observed positive rate against mean predicted probability in 12 probability bins.", out.width="62%"}
+knitr::include_graphics("man/figures/fig07_calibration.png")
+```
+
+The plotted probabilities are mostly close to the diagonal. In the highest group, the mean prediction is about 0.86 and the observed positive rate is about 0.81, so the model slightly overestimates positives there.
+
+## Performance summary
+
+```{r summary-table, results='asis'}
+perf <- data.frame(
+  Metric = c("AUC", "Average precision", "Baseline prevalence", "Accuracy",
+             "Sensitivity", "Specificity", "Precision", "F1"),
+  Value = c(sprintf("%.3f", auc), sprintf("%.3f", ap),
+            sprintf("%.3f", mean(truth_pos)), sprintf("%.1f%%", 100 * cm$accuracy),
+            sprintf("%.1f%%", 100 * cm$sensitivity),
+            sprintf("%.1f%%", 100 * cm$specificity),
+            sprintf("%.1f%%", 100 * cm$precision), sprintf("%.3f", cm$f1))
+)
+kable(perf, align = c("l", "r"),
+      caption = "Out-of-bag performance at the default 0.5 threshold (AUC and AP are threshold-free).")
+```
+
+# Discussion
+
+In this dataset, the model relies most on distance to a splice junction and exon length. It also uses sequence and conservation features.
+
+Limitations to keep in mind:
+
+- At the default cutoff, sensitivity is `r sprintf("%.1f%%", 100 * cm$sensitivity)`. A lower cutoff finds more positive sites but also gives more false positives.
+- The model was trained on this human dataset and its feature definitions. Its results may differ on another dataset or when the input values use different scales.
+- These results use OOB predictions from the training data. I have not checked the model on a separate dataset.
+
+# Reproducibility
+
+| Script | Purpose |
+|------------------------------------|------------------------------------|
+| `data-raw/prepare_oob.R` | Exports OOB probabilities from the fitted model |
+| `data-raw/make_figures.R` | Rebuilds every figure and every number in this report |
+
+```{r session, echo=FALSE, results='asis'}
+si <- sessionInfo()
+pkgs <- c("R" = as.character(getRversion()),
+          "randomForest" = as.character(packageVersion("randomForest")),
+          "ggplot2" = as.character(packageVersion("ggplot2")),
+          "knitr" = as.character(packageVersion("knitr")),
+          "rmarkdown" = as.character(packageVersion("rmarkdown")))
+kable(data.frame(Component = names(pkgs), Version = unname(pkgs)),
+      align = c("l", "l"), caption = "Software used to build this report.")
+```
+
+# License
+
+MIT © the package authors. See `LICENSE`.

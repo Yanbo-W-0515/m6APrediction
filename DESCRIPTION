@@ -1,0 +1,17 @@
+Package: m6APrediction
+Title: Prediction of m6A Sites
+Version: 1.0.0
+Authors@R: 
+    person("Yanbo", "Wang",
+           email = "Yanbo.Wang23@student.xjtlu.edu.cn",
+           role = c("aut", "cre"))
+Description: Predicts m6A sites from input features using a random forest model.
+License: MIT + file LICENSE
+Depends: R (>= 3.5.0)
+Imports: randomForest, stats
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Config/roxygen2/version: 8.1.1
+NeedsCompilation: no
+Author: Yanbo Wang [aut, cre]
+Maintainer: Yanbo Wang <Yanbo.Wang23@student.xjtlu.edu.cn>
